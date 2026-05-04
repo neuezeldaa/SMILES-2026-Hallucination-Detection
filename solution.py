@@ -145,8 +145,10 @@ if __name__=='__main__':
         # The raw `hidden` tensor is released at the end of this loop iteration.
         for i in range(hidden.size(0)):
             feat = aggregation_and_feature_extraction(
-                hidden[i],   # (n_layers, seq_len, hidden_dim)
-                mask[i],     # (seq_len,)
+                hidden[i],  # (n_layers, seq_len, hidden_dim)
+                mask[i],  # (seq_len,)
+                layer_idx=-1,
+                pool_mode="last",
                 use_geometric=USE_GEOMETRIC,
             )
             all_features.append(feat.cpu())
@@ -206,7 +208,10 @@ if __name__=='__main__':
 
         for i in range(hidden.size(0)):
             feat = aggregation_and_feature_extraction(
-                hidden[i], mask[i], use_geometric=USE_GEOMETRIC,
+                hidden[i], mask[i],
+                layer_idx=-1,
+                pool_mode="last",
+                use_geometric=USE_GEOMETRIC,
             )
             test_features.append(feat.cpu())
 
