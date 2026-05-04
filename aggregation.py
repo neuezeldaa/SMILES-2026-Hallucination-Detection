@@ -52,10 +52,13 @@ def aggregate(
     # Shape: (6, seq_len, hidden_dim)
     layers_to_use = hidden_states[-6:]
 
+    # FIX: Ensure mask is on the same device as hidden_states (GPU)
+    device = hidden_states.device
+
     # 2. Создаем маску для токенов ответа (игнорируем padding)
     # attention_mask: (seq_len,) -> 1 для токенов, 0 для паддинга
     # Добавляем измерения для броадкастинга: (1, seq_len, 1)
-    mask = attention_mask.unsqueeze(0).unsqueeze(-1)
+    mask = attention_mask.unsqueeze(0).unsqueeze(-1).to(device)
 
     # 3. Mean Pooling по токенам (dim=1)
     # Сначала зануляем паддинг
@@ -102,11 +105,15 @@ def extract_geometric_features(
     # STUDENT: Improved Strategy - Representation Drift
     # ------------------------------------------------------------------
 
+    # FIX: Ensure mask is on the same device as hidden_states (GPU)
+    device = hidden_states.device
+
     # Возьмем последние 6 слоев
     layers = hidden_states[-6:]
 
     # Усредним по токенам для каждого слоя, чтобы получить вектор слоя
-    mask = attention_mask.unsqueeze(-1)
+    # FIX: Move mask to correct device
+    mask = attention_mask.unsqueeze(-1).to(device)
 
     # Сумма и деление на количество (mean pool)
     layer_means = (layers * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
