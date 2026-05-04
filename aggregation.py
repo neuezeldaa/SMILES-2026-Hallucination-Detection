@@ -41,7 +41,7 @@ import torch.nn.functional as F
 #   [-1]          — only the last layer (original baseline)
 #   [-1, -6, -12] — last + middle + earlier layer concatenated
 #   list(range(24)) — all layers (very high-dim, use PCA in probe)
-LAYER_INDICES: list[int] = [-1, -6, -12]
+LAYER_INDICES: list[int] = [-1]
 
 # How to pool across token positions:
 #   "mean"          — mean over all real (non-padding) tokens
@@ -49,7 +49,7 @@ LAYER_INDICES: list[int] = [-1, -6, -12]
 #   "last"          — last real token (original baseline)
 #   "response_mean" — mean over the second half of real tokens (proxy for
 #                     response tokens when no explicit split is available)
-POOL_MODE: str = "mean"
+POOL_MODE: str = "last"
 
 # ------------------------------------------------------------------
 
