@@ -60,8 +60,10 @@ def aggregate(
     Returns:
         A 1‑D feature tensor of shape ``(num_selected_layers * hidden_dim,)``.
     """
-    mask = _real_token_mask(attention_mask)  # (seq_len,)
-    n_real = mask.sum().clamp(min=1)          # avoid division by zero
+    # Ensure mask is on the same device as hidden_states
+    device = hidden_states.device
+    mask = _real_token_mask(attention_mask.to(device))  # (seq_len,)
+    n_real = mask.sum().clamp(min=1)  # scalar on device
 
     selected = hidden_states[LAYER_INDICES]   # (num_layers, seq_len, hidden_dim)
 
@@ -71,7 +73,7 @@ def aggregate(
     elif POOLING_MODE == "last":
         # Last real token for each selected layer
         real_pos = attention_mask.nonzero(as_tuple=False)[-1]  # last position
-        pooled = selected[:, real_pos, :]
+        pooled = selected[:, real_pos, :].to(device)
     else:
         raise ValueError(f"Unknown POOLING_MODE: {POOLING_MODE}")
 
@@ -103,7 +105,8 @@ def extract_geometric_features(
     Returns:
         A 1‑D float tensor of shape ``(3,)``.
     """
-    mask = _real_token_mask(attention_mask)
+    device = hidden_states.device
+    mask = _real_token_mask(attention_mask.to(device))
     n_real = mask.sum().clamp(min=1)
 
     # Final transformer layer (index -1) and token embeddings (index 0)
