@@ -7,97 +7,72 @@ Converts per-token, per-layer hidden states from the extraction loop in
 
 Two stages can be customised independently:
 
-  1. ``aggregate`` — select layers and pool into a vector.
+  1. ``aggregate`` — select layers and token positions, pool into a vector.
   2. ``extract_geometric_features`` — optional hand-crafted features
      (enabled by setting ``USE_GEOMETRIC = True`` in ``solution.py``).
 
 Both stages are combined by ``aggregation_and_feature_extraction``, the
 single entry point called from the notebook.
-
---- Student notes ---
-layer_idx and pool_mode are passed as arguments so that solution.ipynb
-can run a sweep over all layers without editing this file.
-
-Usage in solution.ipynb:
-    # Single run
-    features = aggregation_and_feature_extraction(
-        hidden_states, attention_mask,
-        layer_idx=-1, pool_mode="last"
-    )
-
-    # Layer sweep (see sweep cell in solution.ipynb)
-    for i in range(n_layers):
-        features = aggregation_and_feature_extraction(
-            hidden_states, attention_mask,
-            layer_idx=i, pool_mode="last"
-        )
 """
 
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
-
-
-def _pool_layer(
-    layer: torch.Tensor,           # (seq_len, hidden_dim)
-    attention_mask: torch.Tensor,  # (seq_len,)
-    pool_mode: str,
-) -> torch.Tensor:
-    """Pool a single layer tensor across token positions."""
-    real_positions = attention_mask.nonzero(as_tuple=False).squeeze(-1)
-
-    if pool_mode == "last":
-        last_pos = int(real_positions[-1].item())
-        return layer[last_pos]
-
-    if pool_mode == "mean":
-        return layer[real_positions].mean(dim=0)
-
-    if pool_mode == "max":
-        return layer[real_positions].max(dim=0).values
-
-    if pool_mode == "response_mean":
-        n_real = len(real_positions)
-        response_positions = real_positions[n_real // 2:]
-        if len(response_positions) == 0:
-            response_positions = real_positions
-        return layer[response_positions].mean(dim=0)
-
-    raise ValueError(f"Unknown pool_mode: {pool_mode!r}")
 
 
 def aggregate(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
-    layer_idx: int = -1,
-    pool_mode: str = "last",
 ) -> torch.Tensor:
     """Convert per-token hidden states into a single feature vector.
 
     Args:
         hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``.
+                        Layer index 0 is the token embedding; index -1 is the
+                        final transformer layer.
         attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
                         tokens and 0 for padding.
-        layer_idx:      Which layer to use. Supports negative indexing.
-                        Pass a list to concatenate multiple layers.
-        pool_mode:      Token pooling strategy: "last", "mean", "max",
-                        "response_mean".
 
     Returns:
-        A 1-D feature tensor of shape ``(hidden_dim,)`` for a single layer,
-        or ``(k * hidden_dim,)`` when layer_idx is a list of k layers.
+        A 1-D feature tensor of shape ``(hidden_dim,)`` or
+        ``(k * hidden_dim,)`` if multiple layers are concatenated.
+
+    Student task:
+        Replace or extend the skeleton below with alternative layer selection,
+        token pooling (mean, max, weighted), or multi-layer fusion strategies.
     """
-    n_layers = hidden_states.shape[0]
+    # ------------------------------------------------------------------
+    # STUDENT: Improved Strategy
+    # 1. Use last 6 layers (richer semantic info).
+    # 2. Mean pool over the response tokens (not just the last one).
+    # 3. Mean pool over the selected layers.
+    # ------------------------------------------------------------------
 
-    # Accept either a single int or a list of ints
-    indices = layer_idx if isinstance(layer_idx, list) else [layer_idx]
-    resolved = [i % n_layers for i in indices]
+    # 1. Берем последние 6 слоев (эмпирически лучший выбор для LLM)
+    # Shape: (6, seq_len, hidden_dim)
+    layers_to_use = hidden_states[-6:]
 
-    pooled = [_pool_layer(hidden_states[i], attention_mask, pool_mode)
-              for i in resolved]
+    # 2. Создаем маску для токенов ответа (игнорируем padding)
+    # attention_mask: (seq_len,) -> 1 для токенов, 0 для паддинга
+    # Добавляем измерения для броадкастинга: (1, seq_len, 1)
+    mask = attention_mask.unsqueeze(0).unsqueeze(-1)
 
-    return torch.cat(pooled, dim=0)
+    # 3. Mean Pooling по токенам (dim=1)
+    # Сначала зануляем паддинг
+    masked_states = layers_to_use * mask
+
+    # Считаем сумму по токенам
+    sum_states = masked_states.sum(dim=1)  # (6, hidden_dim)
+
+    # Делим на количество реальных токенов (чтобы среднее было честным)
+    count_tokens = mask.sum(dim=1).clamp(min=1)  # (6, 1)
+    mean_per_layer = sum_states / count_tokens  # (6, hidden_dim)
+
+    # 4. Mean Pooling по слоям (dim=0)
+    # Усредняем информацию из разных слоев в один вектор
+    final_feature = mean_per_layer.mean(dim=0)  # (hidden_dim,)
+
+    return final_feature
 
 
 def extract_geometric_features(
@@ -106,71 +81,77 @@ def extract_geometric_features(
 ) -> torch.Tensor:
     """Extract hand-crafted geometric / statistical features from hidden states.
 
-    Called only when ``USE_GEOMETRIC = True`` in ``solution.ipynb``.
-
-    Returns a 1-D float tensor of shape ``(2 * n_layers + 1,)``:
-        - n_layers activation norms (normalised)
-        - n_layers - 1 inter-layer cosine similarities (representation drift)
-        - 1 variance-across-layers scalar
-        - 1 normalised sequence length
-    """
-    n_layers = hidden_states.shape[0]
-    real_positions = attention_mask.nonzero(as_tuple=False).squeeze(-1)
-
-    # Layer-wise mean representations
-    layer_means = torch.stack(
-        [hidden_states[i][real_positions].mean(dim=0) for i in range(n_layers)]
-    )  # (n_layers, hidden_dim)
-
-    # 1. Activation norms per layer
-    norms = layer_means.norm(dim=-1)
-    norms = norms / (norms.max() + 1e-8)
-
-    # 2. Inter-layer cosine similarity (representation drift)
-    cosine_sims = []
-    for i in range(n_layers - 1):
-        sim = F.cosine_similarity(
-            layer_means[i].unsqueeze(0),
-            layer_means[i + 1].unsqueeze(0)
-        ).squeeze()
-        cosine_sims.append(sim)
-    drift = torch.stack(cosine_sims)  # (n_layers - 1,)
-
-    # 3. Variance of representations across layers (scalar)
-    var_across_layers = layer_means.var(dim=0).mean().unsqueeze(0)
-
-    # 4. Normalised sequence length (scalar)
-    seq_len_feat = torch.tensor(
-        [real_positions.numel() / hidden_states.shape[1]],
-        dtype=torch.float32
-    )
-
-    return torch.cat([norms, drift, var_across_layers, seq_len_feat], dim=0)
-
-
-def aggregation_and_feature_extraction(
-    hidden_states: torch.Tensor,
-    attention_mask: torch.Tensor,
-    layer_idx: int | list[int] = -1,
-    pool_mode: str = "last",
-    use_geometric: bool = False,
-) -> torch.Tensor:
-    """Aggregate hidden states and optionally append geometric features.
-
-    Main entry point called from ``solution.ipynb`` for each sample.
+    Called only when ``USE_GEOMETRIC = True`` in ``solution.ipynb``.  The
+    returned tensor is concatenated with the output of ``aggregate``.
 
     Args:
         hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``.
         attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
                         tokens and 0 for padding.
-        layer_idx:      Layer index (int) or list of indices to concatenate.
-        pool_mode:      Token pooling: "last", "mean", "max", "response_mean".
-        use_geometric:  Whether to append geometric features.
 
     Returns:
-        A 1-D float tensor of shape ``(feature_dim,)``.
+        A 1-D float tensor of shape ``(n_geometric_features,)``.  The length
+        must be the same for every sample.
+
+    Student task:
+        Replace the stub below.  Possible features: layer-wise activation
+        norms, inter-layer cosine similarity (representation drift), or
+        sequence length.
     """
-    agg_features = aggregate(hidden_states, attention_mask, layer_idx, pool_mode)
+    # ------------------------------------------------------------------
+    # STUDENT: Improved Strategy - Representation Drift
+    # ------------------------------------------------------------------
+
+    # Возьмем последние 6 слоев
+    layers = hidden_states[-6:]
+
+    # Усредним по токенам для каждого слоя, чтобы получить вектор слоя
+    mask = attention_mask.unsqueeze(-1)
+
+    # Сумма и деление на количество (mean pool)
+    layer_means = (layers * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+    # shape: (6, hidden_dim)
+
+    # Посчитаем косинусное расстояние между соседними слоями
+    # Если модель "уверена", слои похожи (drift low). Если "галлюцинирует", могут быть хаотичны.
+    drifts = []
+    for i in range(len(layer_means) - 1):
+        cos_sim = torch.nn.functional.cosine_similarity(
+            layer_means[i].unsqueeze(0),
+            layer_means[i+1].unsqueeze(0)
+        )
+        drifts.append(cos_sim)
+
+    # Вернем вектор из косинусных сходств (длина 5)
+    return torch.cat(drifts).detach()
+
+
+def aggregation_and_feature_extraction(
+    hidden_states: torch.Tensor,
+    attention_mask: torch.Tensor,
+    use_geometric: bool = False,
+) -> torch.Tensor:
+    """Aggregate hidden states and optionally append geometric features.
+
+    Main entry point called from ``solution.ipynb`` for each sample.
+    Concatenates the output of ``aggregate`` with that of
+    ``extract_geometric_features`` when ``use_geometric=True``.
+
+    Args:
+        hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``
+                        for a single sample.
+        attention_mask: 1-D tensor of shape ``(seq_len,)`` with 1 for real
+                        tokens and 0 for padding.
+        use_geometric:  Whether to append geometric features.  Controlled by
+                        the ``USE_GEOMETRIC`` flag in ``solution.ipynb``.
+
+    Returns:
+        A 1-D float tensor of shape ``(feature_dim,)`` where
+        ``feature_dim = hidden_dim`` (or larger for multi-layer or geometric
+        concatenations).
+    """
+    # Эта функция осталась оригинальной, она просто склеивает результаты
+    agg_features = aggregate(hidden_states, attention_mask)  # (feature_dim,)
 
     if use_geometric:
         geo_features = extract_geometric_features(hidden_states, attention_mask)
