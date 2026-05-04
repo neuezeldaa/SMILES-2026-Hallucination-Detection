@@ -55,37 +55,16 @@ class HallucinationProbe(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass — returns raw logits of shape ``(n_samples,)``.
-
-        Args:
-            x: Float tensor of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            1-D tensor of raw (pre-sigmoid) logits.
-        """
+        """Forward pass — returns raw logits of shape ``(n_samples,)``."""
         if not self._nets:
             raise RuntimeError(
                 "Ensemble has not been built yet. Call fit() before forward()."
             )
-        # Default to first member for signature compatibility;
-        # predict_proba handles proper ensemble averaging.
+        # Returns 1D logits for compatibility
         return self._nets[0](x).squeeze(-1)
 
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
-        """Train the probe on labelled feature vectors using Bagging.
-
-        Scales features with ``StandardScaler``, builds an ensemble of 5
-        networks, and optimises each with Adam + ``BCEWithLogitsLoss``.
-        Each member is trained on a bootstrap sample of the data.
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-            y: Integer label vector of shape ``(n_samples,)``; 0 = truthful,
-               1 = hallucinated.
-
-        Returns:
-            ``self`` (for method chaining).
-        """
+        """Train the probe on labelled feature vectors using Bagging."""
         X_scaled = self._scaler.fit_transform(X)
 
         X_t = torch.from_numpy(X_scaled).float()
@@ -109,12 +88,13 @@ class HallucinationProbe(nn.Module):
             n_samples = len(X_t)
             indices = torch.randint(0, n_samples, (n_samples,))
             X_boot = X_t[indices]
-            y_boot = y_t[indices]
+            y_boot = y_t[indices]  # Shape: [batch]
 
             net.train()
             for epoch in range(150):
                 optimizer.zero_grad()
-                logits = net(X_boot)
+                # FIX: Squeeze to [batch] to match y_boot shape
+                logits = net(X_boot).squeeze(-1)
                 loss = criterion(logits, y_boot)
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
@@ -129,17 +109,7 @@ class HallucinationProbe(nn.Module):
     def fit_hyperparameters(
         self, X_val: np.ndarray, y_val: np.ndarray
     ) -> "HallucinationProbe":
-        """Tune the decision threshold on a validation set to maximise F1.
-
-        Args:
-            X_val: Validation feature matrix of shape
-                   ``(n_val_samples, feature_dim)``.
-            y_val: Integer label vector of shape ``(n_val_samples,)``;
-                   0 = truthful, 1 = hallucinated.
-
-        Returns:
-            ``self`` (for method chaining).
-        """
+        """Tune the decision threshold on a validation set to maximise F1."""
         probs = self.predict_proba(X_val)[:, 1]
 
         candidates = np.unique(np.concatenate([probs, np.linspace(0.0, 1.0, 101)]))
@@ -157,35 +127,19 @@ class HallucinationProbe(nn.Module):
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
-        """Predict binary labels for feature vectors.
-
-        Uses the decision threshold in ``self._threshold``.
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            Integer array of shape ``(n_samples,)`` with values in ``{0, 1}``.
-        """
+        """Predict binary labels for feature vectors."""
         return (self.predict_proba(X)[:, 1] >= self._threshold).astype(int)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        """Return class probability estimates by averaging ensemble members.
-
-        Args:
-            X: Feature matrix of shape ``(n_samples, feature_dim)``.
-
-        Returns:
-            Array of shape ``(n_samples, 2)`` where column 1 contains the
-            estimated probability of the hallucinated class (label 1).
-        """
+        """Return class probability estimates by averaging ensemble members."""
         X_scaled = self._scaler.transform(X)
         X_t = torch.from_numpy(X_scaled).float()
 
         all_probs = []
         with torch.no_grad():
             for net in self._nets:
-                logits = net(X_t)
+                # FIX: Squeeze to 1D for consistent probability calculation
+                logits = net(X_t).squeeze(-1)
                 prob_pos = torch.sigmoid(logits).numpy()
                 all_probs.append(prob_pos)
 
