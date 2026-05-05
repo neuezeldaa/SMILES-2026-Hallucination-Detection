@@ -59,6 +59,10 @@ def aggregate(
     n_layers = hidden_states.shape[0]
     layer_indices = _select_layer_indices(n_layers)
 
+    # solution.py passes hidden_states on the LLM's device (cuda/mps) and
+    # attention_mask on CPU; align them before any arithmetic.
+    attention_mask = attention_mask.to(hidden_states.device)
+
     # Index of the last real (non-padding) token.
     real_positions = attention_mask.nonzero(as_tuple=False)
     last_pos = int(real_positions[-1].item())
@@ -103,6 +107,7 @@ def extract_geometric_features(
     Returns:
         A fixed-length 1-D float tensor.
     """
+    attention_mask = attention_mask.to(hidden_states.device)
     real_mask = attention_mask.bool()
     real_positions = attention_mask.nonzero(as_tuple=False).squeeze(-1)
     last_pos = int(real_positions[-1].item())
@@ -113,7 +118,9 @@ def extract_geometric_features(
     pieces: list[torch.Tensor] = []
 
     # 1. Sequence length, scaled to roughly [0, 1].
-    pieces.append(torch.tensor([n_real / 512.0], dtype=torch.float32))
+    pieces.append(
+        torch.tensor([n_real / 512.0], dtype=torch.float32, device=hidden_states.device)
+    )
 
     # 2. Layer-wise mean activation norm.
     layer_norms = real_states.norm(dim=-1).mean(dim=-1)  # (n_layers,)
