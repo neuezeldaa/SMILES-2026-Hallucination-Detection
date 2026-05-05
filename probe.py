@@ -44,15 +44,15 @@ from aggregation import SLICE_INFO
 
 # Set True to apply a single PCA to the full vector before sub-probes.
 # Fixes the high-dimensionality / overfitting problem.
-USE_GLOBAL_PCA = True
-GLOBAL_PCA_COMPONENTS = 128      # 128 << 465 train samples per fold
+USE_GLOBAL_PCA = False
+GLOBAL_PCA_COMPONENTS = 512      # 128 << 465 train samples per fold
 
 # Extended C grid — goes lower than before (previous optimum was 0.01
 # across all folds, suggesting we need more regularisation options).
 _C_GRID = (1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0)
 
 _PCA_TRIGGER_DIM = 512           # sub-probe PCA threshold (used when USE_GLOBAL_PCA=False)
-_PCA_COMPONENTS  = 128           # sub-probe PCA components
+_PCA_COMPONENTS  = 512          # sub-probe PCA components
 _SEED = 42
 
 # Sub-probes: when USE_GLOBAL_PCA=True all three see the same 128-d input,
@@ -60,7 +60,7 @@ _SEED = 42
 _SUBPROBES = (
     ("A", False),
     ("C", False),
-    ("D", False),   # no sub-PCA needed after global PCA
+    ("D", True),   # no sub-PCA needed after global PCA
 )
 
 
