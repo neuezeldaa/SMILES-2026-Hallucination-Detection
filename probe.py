@@ -1,33 +1,13 @@
 """
-probe.py — Hallucination probe classifier (multi-seed LogReg ensemble).
+probe.py — Multi-seed LogReg ensemble (auto-detects optional GEO slice).
 
-Final design — probability-level ensemble of three LogReg sub-probes, one
-per aggregation slice (A, C, D2), each averaged over multiple random
-seeds:
+If aggregation.SLICE_INFO contains a GEO key (i.e. solution.py was run
+with USE_GEOMETRIC=True), a fourth sub-probe is added that operates on
+the geometric-feature slice.
 
-    A : layer 15, last token only       (896-d)
-    C : layer 15, last + mean + max     (2688-d)
-    D2: layer 14, last + mean           (1792-d)
-
-Inference:
-    For every sub-probe, average positive-class probabilities across N
-    LogReg fits with different ``random_state`` values.  Then average the
-    three sub-probes' resulting probabilities.
-
-Why an ensemble:
-    Single sub-probes scored 70.4-72.2% AUROC with std 4.3-7.1% across
-    folds.  Probability averaging keeps the shared truthfulness signal
-    while cancelling pooling-specific noise.
-
-Why multi-seed bagging on top:
-    diagnose_v4 showed that averaging LogReg fits with different seeds
-    (which differ in solver path and inner-CV C selection) reduces
-    variance: A+C+D2 single-seed scored 72.92%; multi-seed scored 73.64%
-    with comparable std.  The multi-seed A+C+D2 configuration produced
-    the best lower bound (mean - std = 68.53%) of all variants tested.
-
-Slice boundaries are read from ``aggregation.SLICE_INFO`` so the probe
-stays in sync with the aggregator without hard-coding dimensions.
+This file is for the ablation experiment "what if geometric features
+are properly wired into the ensemble".  Use the standard probe.py in
+production.
 """
 
 from __future__ import annotations
@@ -45,34 +25,20 @@ from aggregation import SLICE_INFO
 
 
 _C_GRID = (0.001, 0.01, 0.1, 1.0, 10.0)
-_PCA_TRIGGER_DIM = 4096           # only large slices get PCA
+_PCA_TRIGGER_DIM = 4096
 _PCA_COMPONENTS = 256
-_SEEDS = (42, 7, 123, 2024, 31)   # multi-seed bagging seeds
-
-# Sub-probes participating in the ensemble.  ``use_pca`` is enabled only
-# for slices wider than _PCA_TRIGGER_DIM (none in the current config —
-# the largest is C at 2688).  Kept generic so future configurations can
-# enable PCA per-slice.
-_SUBPROBES = (
-    ("A",  False),
-    ("C",  False),
-    ("D2", False),
-)
+_SEEDS = (42, 7, 123, 2024, 31)
 
 
 class _SubProbe:
-    """Multi-seed bagged LogReg pipeline on one feature slice."""
-
     def __init__(self, slice_key: str, use_pca: bool) -> None:
         self.slice_key = slice_key
         self.use_pca = use_pca
         self.scaler: StandardScaler | None = None
         self.pca: PCA | None = None
-        # One classifier per seed (multi-seed bagging).
         self.clfs: list[LogisticRegression] = []
         self.best_Cs: list[float] = []
 
-    # ------------------------------------------------------------------
     def _slice(self, X: np.ndarray) -> np.ndarray:
         sl = SLICE_INFO[self.slice_key]
         return X[:, sl]
@@ -99,7 +65,6 @@ class _SubProbe:
                 best_score, best_C = m, C
         return best_C
 
-    # ------------------------------------------------------------------
     def fit(self, X: np.ndarray, y: np.ndarray) -> "_SubProbe":
         Xs = self._slice(X)
 
@@ -138,36 +103,36 @@ class _SubProbe:
         Xs = self.scaler.transform(Xs)
         if self.pca is not None:
             Xs = self.pca.transform(Xs)
-        # Average positive-class probabilities across seeds.
         probs_list = [clf.predict_proba(Xs)[:, 1] for clf in self.clfs]
         return np.mean(np.stack(probs_list), axis=0)
 
 
-# ----------------------------------------------------------------------
-# Public API
-# ----------------------------------------------------------------------
+def _build_subprobes() -> list[_SubProbe]:
+    """Build sub-probes based on what slices exist in SLICE_INFO.
+
+    Always builds A, C, D2.  Adds a GEO sub-probe if SLICE_INFO contains
+    the GEO key (which it does only when USE_GEOMETRIC=True).
+    """
+    keys = [("A", False), ("C", False), ("D2", False)]
+    if "GEO" in SLICE_INFO:
+        keys.append(("GEO", False))
+    return [_SubProbe(k, p) for k, p in keys]
+
+
 class HallucinationProbe(nn.Module):
-    """Probability-level ensemble of three multi-seed LogReg sub-probes."""
+    """Probability-level ensemble of multi-seed LogReg sub-probes."""
 
     def __init__(self) -> None:
         super().__init__()
-        self._net: nn.Sequential | None = None  # nn.Module compatibility
-
-        self._subprobes: list[_SubProbe] = [
-            _SubProbe(key, use_pca) for key, use_pca in _SUBPROBES
-        ]
+        self._net: nn.Sequential | None = None
+        self._subprobes: list[_SubProbe] = []
         self._threshold: float = 0.5
 
-    # ------------------------------------------------------------------
-    # nn.Module compatibility — ``forward`` is unused at inference but
-    # exists so any external code calling it does not crash.
-    # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self._net is None:
             self._net = nn.Sequential(nn.Linear(x.shape[-1], 1))
         return self._net(x).squeeze(-1)
 
-    # ------------------------------------------------------------------
     def fit(self, X: np.ndarray, y: np.ndarray) -> "HallucinationProbe":
         np.random.seed(42)
         torch.manual_seed(42)
@@ -178,20 +143,18 @@ class HallucinationProbe(nn.Module):
                 "at least once before HallucinationProbe.fit()."
             )
 
+        # Build sub-probes lazily based on what slices are present.
+        if not self._subprobes:
+            self._subprobes = _build_subprobes()
+
         y_arr = np.asarray(y).astype(np.int64)
         for sp in self._subprobes:
             sp.fit(X, y_arr)
         return self
 
-    # ------------------------------------------------------------------
     def fit_hyperparameters(
         self, X_val: np.ndarray, y_val: np.ndarray
     ) -> "HallucinationProbe":
-        """Tune the decision threshold on a validation set to maximise F1.
-
-        AUROC (the competition metric) is rank-based and unaffected; this
-        is here purely so the printed Accuracy/F1 are meaningful.
-        """
         probs = self.predict_proba(X_val)[:, 1]
         candidates = np.unique(np.concatenate([probs, np.linspace(0.0, 1.0, 101)]))
 
@@ -207,12 +170,10 @@ class HallucinationProbe(nn.Module):
         self._threshold = best_threshold
         return self
 
-    # ------------------------------------------------------------------
     def predict(self, X: np.ndarray) -> np.ndarray:
         return (self.predict_proba(X)[:, 1] >= self._threshold).astype(int)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
-        # Average positive-class probabilities across sub-probes.
         probs_pos = np.mean(
             np.stack([sp.predict_proba_pos(X) for sp in self._subprobes]),
             axis=0,
