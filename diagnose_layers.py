@@ -1,24 +1,22 @@
 """
-diagnose_final.py — Compare aggregation variants with LogReg + group K-fold.
+diagnose_v3.py — Search for the most stable configuration.
 
-After diagnose_layers.py identified layer 15 as the best single layer
-(70.68% ± 3.22%), this script compares richer aggregation strategies on
-top of that layer to pick the final configuration.  Each variant is
-evaluated with the same LogReg + group-aware 5-fold CV pipeline so the
-numbers are directly comparable.
+Variant A (layer 15, last token, 896-d) gave the highest mean AUROC
+(72.17%) but with a worrying std of 7.07%, while C/D were 1-2 p.p. lower
+but noticeably more stable.  This script answers two questions:
 
-Variants:
-    A. layer 15, last token only                         (896-d)
-    B. layer 15, last + mean pool                        (1792-d)
-    C. layer 15, last + mean + max pool                  (2688-d)
-    D. layers [13, 14, 15, 16], last + mean              (7168-d)  [+PCA]
-    E. layer 15 (B) + geometric features (length, drift) (~1820-d)
+  1. Can stronger L2 regularisation lower A's std without hurting its mean?
+  2. Does a probability-level ensemble of A and C beat either alone?
 
-Run from repo root:
-    python diagnose_final.py
+Variants tested:
+    A_extreme_C    layer 15 last-only, C grid extended to 1e-5..10
+    A_high_reg     layer 15 last-only, C fixed at 1e-4 / 1e-3 / 1e-2 / 1e-1
+    Ensemble_AC    avg(predict_proba) of A and C — diversity helps stability
+    Ensemble_ACD   avg of A, C, and D
+    Ensemble_BC    avg of B and C — both stable variants
 
-Output:
-    final_diagnostics.json  — per-variant metrics
+Run:
+    python diagnose_v3.py
 """
 
 from __future__ import annotations
@@ -30,12 +28,10 @@ import time
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
 from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import GroupKFold, StratifiedKFold
-from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
@@ -43,7 +39,7 @@ from model import MAX_LENGTH, get_model_and_tokenizer
 
 
 DATA_FILE = "./data/dataset.csv"
-OUTPUT_FILE = "final_diagnostics.json"
+OUTPUT_FILE = "v3_diagnostics.json"
 BATCH_SIZE = 4
 N_FOLDS = 5
 
@@ -52,7 +48,6 @@ _CONTEXT_RE = re.compile(
 )
 _BEST_LAYER = 15
 _NEIGHBOR_LAYERS = (13, 14, 15, 16)
-_C_GRID = (0.001, 0.01, 0.1, 1.0, 10.0)
 
 
 def _extract_context(prompt: str) -> str:
@@ -61,18 +56,16 @@ def _extract_context(prompt: str) -> str:
 
 
 # ------------------------------------------------------------
-# Per-sample features for each variant
+# Per-sample feature extractors (same as in diagnose_final.py)
 # ------------------------------------------------------------
-def variant_A_last(hidden_states, attention_mask):
-    """Layer 15, last token only."""
+def variant_A(hidden_states, attention_mask):
     layer = hidden_states[_BEST_LAYER]
     am = attention_mask.to(layer.device)
     last_pos = int(am.nonzero(as_tuple=False)[-1].item())
     return layer[last_pos]
 
 
-def variant_B_last_mean(hidden_states, attention_mask):
-    """Layer 15: last + mean pool."""
+def variant_B(hidden_states, attention_mask):
     layer = hidden_states[_BEST_LAYER]
     am = attention_mask.to(layer.device)
     last_pos = int(am.nonzero(as_tuple=False)[-1].item())
@@ -83,8 +76,7 @@ def variant_B_last_mean(hidden_states, attention_mask):
     return torch.cat([last_tok, mean_tok], dim=0)
 
 
-def variant_C_last_mean_max(hidden_states, attention_mask):
-    """Layer 15: last + mean + max pool."""
+def variant_C(hidden_states, attention_mask):
     layer = hidden_states[_BEST_LAYER]
     am = attention_mask.to(layer.device)
     last_pos = int(am.nonzero(as_tuple=False)[-1].item())
@@ -97,8 +89,7 @@ def variant_C_last_mean_max(hidden_states, attention_mask):
     return torch.cat([last_tok, mean_tok, max_tok], dim=0)
 
 
-def variant_D_neighbors(hidden_states, attention_mask):
-    """Layers 13-16: last + mean per layer."""
+def variant_D(hidden_states, attention_mask):
     am = attention_mask.to(hidden_states.device)
     last_pos = int(am.nonzero(as_tuple=False)[-1].item())
     mask_f = am.float().unsqueeze(-1)
@@ -112,57 +103,13 @@ def variant_D_neighbors(hidden_states, attention_mask):
     return torch.cat(pieces, dim=0)
 
 
-def variant_E_with_geometric(hidden_states, attention_mask):
-    """Variant B + geometric features."""
-    base = variant_B_last_mean(hidden_states, attention_mask)
-    am = attention_mask.to(hidden_states.device)
-    real_mask = am.bool()
-    n_real = float(real_mask.sum().item())
-
-    # Length (scaled)
-    length_feat = torch.tensor([n_real / 512.0], dtype=torch.float32,
-                                device=hidden_states.device)
-
-    # Inter-layer cosine drift (mean-pooled per layer)
-    real_states = hidden_states[:, real_mask, :]
-    layer_means = real_states.mean(dim=1)
-    cos_sims = F.cosine_similarity(layer_means[:-1], layer_means[1:], dim=-1)
-
-    # Last-token drift across layers
-    real_pos = am.nonzero(as_tuple=False).squeeze(-1)
-    last_pos = int(real_pos[-1].item())
-    last_per_layer = hidden_states[:, last_pos, :]
-    last_drift = (last_per_layer[1:] - last_per_layer[:-1]).norm(dim=-1)
-
-    # Layer-wise norms
-    layer_norms = real_states.norm(dim=-1).mean(dim=-1)
-
-    geo = torch.cat([
-        length_feat,
-        cos_sims.float(),
-        last_drift.float(),
-        layer_norms.float(),
-    ], dim=0)
-    return torch.cat([base, geo], dim=0)
-
-
-VARIANTS = [
-    ("A_last_only",      variant_A_last,           False),
-    ("B_last_mean",      variant_B_last_mean,      False),
-    ("C_last_mean_max",  variant_C_last_mean_max,  False),
-    ("D_neighbors",      variant_D_neighbors,      True),   # PCA on
-    ("E_with_geometric", variant_E_with_geometric, False),
-]
-
-
 # ------------------------------------------------------------
-# Evaluation helpers
+# Pipeline helpers
 # ------------------------------------------------------------
-def _select_best_C(X, y, seed=42):
-    """3-fold inner CV by AUROC."""
+def _select_best_C(X, y, C_grid, seed=42):
     skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=seed)
-    best_C, best_score = 1.0, -1.0
-    for C in _C_GRID:
+    best_C, best_score = C_grid[0], -1.0
+    for C in C_grid:
         scores = []
         for idx_tr, idx_vl in skf.split(X, y):
             clf = LogisticRegression(C=C, max_iter=2000, class_weight="balanced",
@@ -179,34 +126,27 @@ def _select_best_C(X, y, seed=42):
     return best_C
 
 
-def evaluate_variant(X, y, splits, use_pca=False):
-    """Group-K-fold AUROC for a given feature matrix."""
-    fold_aurocs = []
-    chosen_Cs = []
-    for idx_train, idx_test in splits:
-        Xtr_raw, Xte_raw = X[idx_train], X[idx_test]
-        ytr = y[idx_train]
+def fit_predict_proba(X, y, idx_train, idx_test, C_grid, use_pca=False):
+    """Standard pipeline: scale -> [PCA] -> LogReg with C-tuned. Returns probs on test."""
+    Xtr_raw, Xte_raw = X[idx_train], X[idx_test]
+    ytr = y[idx_train]
 
-        scaler = StandardScaler()
-        Xtr = scaler.fit_transform(Xtr_raw)
-        Xte = scaler.transform(Xte_raw)
+    scaler = StandardScaler()
+    Xtr = scaler.fit_transform(Xtr_raw)
+    Xte = scaler.transform(Xte_raw)
 
-        if use_pca and Xtr.shape[1] > 512:
-            n_comp = min(256, Xtr.shape[0] - 1)
-            pca = PCA(n_components=n_comp, random_state=42)
-            Xtr = pca.fit_transform(Xtr)
-            Xte = pca.transform(Xte)
+    if use_pca and Xtr.shape[1] > 512:
+        n_comp = min(256, Xtr.shape[0] - 1)
+        pca = PCA(n_components=n_comp, random_state=42)
+        Xtr = pca.fit_transform(Xtr)
+        Xte = pca.transform(Xte)
 
-        best_C = _select_best_C(Xtr, ytr)
-        chosen_Cs.append(best_C)
+    best_C = _select_best_C(Xtr, ytr, C_grid)
 
-        clf = LogisticRegression(C=best_C, max_iter=5000, class_weight="balanced",
-                                  solver="lbfgs", random_state=42)
-        clf.fit(Xtr, ytr)
-        probs = clf.predict_proba(Xte)[:, 1]
-        fold_aurocs.append(roc_auc_score(y[idx_test], probs))
-
-    return fold_aurocs, chosen_Cs
+    clf = LogisticRegression(C=best_C, max_iter=5000, class_weight="balanced",
+                              solver="lbfgs", random_state=42)
+    clf.fit(Xtr, ytr)
+    return clf.predict_proba(Xte)[:, 1], best_C
 
 
 # ------------------------------------------------------------
@@ -227,9 +167,10 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     model.to(device)
 
-    # Compute features for ALL variants in one extraction pass
-    print("\nExtracting hidden states once for all variants...")
-    features_by_variant: dict[str, list] = {name: [] for name, _, _ in VARIANTS}
+    # Extract features for A, B, C, D once
+    print("\nExtracting hidden states for A/B/C/D...")
+    feats = {"A": [], "B": [], "C": [], "D": []}
+    extractors = {"A": variant_A, "B": variant_B, "C": variant_C, "D": variant_D}
 
     t0 = time.time()
     for start in tqdm(range(0, len(all_texts), BATCH_SIZE),
@@ -239,66 +180,109 @@ def main():
                               truncation=True, max_length=MAX_LENGTH)
         input_ids = encoding["input_ids"].to(device)
         attention_mask = encoding["attention_mask"].to(device)
-
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-
         hidden = torch.stack(outputs.hidden_states, dim=1).float()
-
         for i in range(hidden.size(0)):
-            for name, fn, _ in VARIANTS:
-                feat = fn(hidden[i], attention_mask[i])
-                features_by_variant[name].append(feat.cpu().numpy())
+            for name, fn in extractors.items():
+                feats[name].append(fn(hidden[i], attention_mask[i]).cpu().numpy())
 
     extract_time = time.time() - t0
     print(f"Extraction done in {extract_time:.1f}s")
 
-    # Stack
-    X_by_variant = {name: np.vstack(feats) for name, feats in features_by_variant.items()}
-    print("Variant feature shapes:")
-    for name, X in X_by_variant.items():
-        print(f"  {name:>20}: {X.shape}")
+    X = {name: np.vstack(arr) for name, arr in feats.items()}
+    for name, M in X.items():
+        print(f"  X[{name}]: {M.shape}")
 
-    # Group K-fold
     gkf = GroupKFold(n_splits=N_FOLDS)
     splits = list(gkf.split(np.arange(len(y)), y, groups))
 
-    # Evaluate each variant
-    print(f"\nEvaluating {len(VARIANTS)} variants with {N_FOLDS}-fold group CV...")
-    print(f"{'Variant':>22} {'Mean AUROC':>13} {'Std':>8}  Picked Cs")
-    print("-" * 70)
-
     results = {}
-    for name, _, use_pca in VARIANTS:
-        X = X_by_variant[name]
-        fold_aurocs, chosen_Cs = evaluate_variant(X, y, splits, use_pca=use_pca)
-        mean_a = float(np.mean(fold_aurocs))
-        std_a = float(np.std(fold_aurocs))
-        results[name] = {
-            "mean_auroc": mean_a,
-            "std_auroc": std_a,
-            "fold_aurocs": fold_aurocs,
-            "chosen_Cs": chosen_Cs,
-            "feature_dim": int(X.shape[1]),
-            "use_pca": use_pca,
-        }
-        print(f"{name:>22} {mean_a*100:>12.2f}% {std_a*100:>7.2f}%  {chosen_Cs}")
 
-    # Sorted summary
-    sorted_variants = sorted(results.items(), key=lambda kv: kv[1]["mean_auroc"], reverse=True)
+    # ---------- A_extreme_C: extended grid ----------
+    print("\n--- A_extreme_C (layer 15 last, C grid 1e-5..10) ---")
+    grid_extreme = (1e-5, 1e-4, 1e-3, 1e-2, 1e-1, 1.0, 10.0)
+    fold_aurocs, chosen = [], []
+    for idx_tr, idx_te in splits:
+        probs, c = fit_predict_proba(X["A"], y, idx_tr, idx_te, grid_extreme)
+        fold_aurocs.append(roc_auc_score(y[idx_te], probs))
+        chosen.append(c)
+    results["A_extreme_C"] = {
+        "mean_auroc": float(np.mean(fold_aurocs)),
+        "std_auroc": float(np.std(fold_aurocs)),
+        "fold_aurocs": fold_aurocs,
+        "chosen_Cs": chosen,
+    }
+    print(f"  mean={np.mean(fold_aurocs)*100:.2f}%  std={np.std(fold_aurocs)*100:.2f}%  Cs={chosen}")
+
+    # ---------- A_high_reg: small Cs only ----------
+    print("\n--- A_high_reg (layer 15 last, C grid 1e-4..1e-1) ---")
+    grid_high = (1e-4, 1e-3, 1e-2, 1e-1)
+    fold_aurocs, chosen = [], []
+    for idx_tr, idx_te in splits:
+        probs, c = fit_predict_proba(X["A"], y, idx_tr, idx_te, grid_high)
+        fold_aurocs.append(roc_auc_score(y[idx_te], probs))
+        chosen.append(c)
+    results["A_high_reg"] = {
+        "mean_auroc": float(np.mean(fold_aurocs)),
+        "std_auroc": float(np.std(fold_aurocs)),
+        "fold_aurocs": fold_aurocs,
+        "chosen_Cs": chosen,
+    }
+    print(f"  mean={np.mean(fold_aurocs)*100:.2f}%  std={np.std(fold_aurocs)*100:.2f}%  Cs={chosen}")
+
+    # ---------- Standard grid for A/B/C/D (recompute, used for ensembles) ----------
+    grid_std = (0.001, 0.01, 0.1, 1.0, 10.0)
+    print("\n--- Computing per-fold probs for A/B/C/D for ensemble ---")
+    per_variant_probs: dict[str, list[np.ndarray]] = {n: [] for n in "ABCD"}
+    per_variant_aurocs: dict[str, list[float]] = {n: [] for n in "ABCD"}
+
+    for fold_i, (idx_tr, idx_te) in enumerate(splits):
+        for name in "ABCD":
+            use_pca = (name == "D")
+            probs, _ = fit_predict_proba(X[name], y, idx_tr, idx_te, grid_std, use_pca=use_pca)
+            per_variant_probs[name].append(probs)
+            per_variant_aurocs[name].append(roc_auc_score(y[idx_te], probs))
+
+    # Sanity: print per-variant per-fold to confirm we reproduce v2 numbers
+    print("Per-variant AUROCs per fold (sanity check):")
+    for name in "ABCD":
+        m = np.mean(per_variant_aurocs[name])
+        s = np.std(per_variant_aurocs[name])
+        print(f"  {name}: mean={m*100:.2f}% std={s*100:.2f}%  folds={[f'{a:.4f}' for a in per_variant_aurocs[name]]}")
+
+    # ---------- Ensembles ----------
+    def ensemble_aurocs(name_list):
+        aurocs = []
+        for fold_i, (_, idx_te) in enumerate(splits):
+            stacked = np.mean(np.stack(
+                [per_variant_probs[n][fold_i] for n in name_list]
+            ), axis=0)
+            aurocs.append(roc_auc_score(y[idx_te], stacked))
+        return aurocs
+
+    for combo in [("A", "C"), ("A", "B"), ("A", "D"),
+                  ("A", "C", "D"), ("B", "C"), ("A", "B", "C", "D")]:
+        name = "Ensemble_" + "".join(combo)
+        fa = ensemble_aurocs(combo)
+        results[name] = {
+            "mean_auroc": float(np.mean(fa)),
+            "std_auroc": float(np.std(fa)),
+            "fold_aurocs": fa,
+        }
+        print(f"  {name:>20}: mean={np.mean(fa)*100:.2f}%  std={np.std(fa)*100:.2f}%")
+
+    # ---------- Ranked summary ----------
     print("\n" + "=" * 60)
     print("RANKED RESULTS")
     print("=" * 60)
-    for name, r in sorted_variants:
+    sorted_r = sorted(results.items(), key=lambda kv: kv[1]["mean_auroc"], reverse=True)
+    for name, r in sorted_r:
         print(f"  {name:>22}: {r['mean_auroc']*100:.2f}% ± {r['std_auroc']*100:.2f}%  "
-              f"(dim={r['feature_dim']})")
+              f"(lower bound {(r['mean_auroc']-r['std_auroc'])*100:.2f}%)")
 
     with open(OUTPUT_FILE, "w") as f:
-        json.dump({
-            "n_folds": N_FOLDS,
-            "extract_time_s": extract_time,
-            "results": results,
-        }, f, indent=2)
+        json.dump(results, f, indent=2)
     print(f"\nSaved to '{OUTPUT_FILE}'")
 
 
