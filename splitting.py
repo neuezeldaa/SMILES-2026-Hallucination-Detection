@@ -1,24 +1,44 @@
 """
-splitting.py — Train / validation / test split utilities (student-implementable).
+splitting.py — Train / validation / test split utilities.
 
-``split_data`` receives the label array ``y`` and, optionally, the full
-DataFrame ``df`` (for group-aware splits).  It must return a list of
-``(idx_train, idx_val, idx_test)`` tuples of integer index arrays.
+Group-aware split: samples that share the same context (the passage between
+the system prompt and the "Note that..." marker) are kept entirely within a
+single fold to prevent context leakage across train/val/test.
 
-Contract
---------
-* ``idx_train``, ``idx_val``, ``idx_test`` are 1-D NumPy arrays of integer
-  indices into the full dataset.
-* ``idx_val`` may be ``None`` if no separate validation fold is needed.
-* All indices must be non-overlapping; together they must cover every sample.
-* Return a **list** — one element for a single split, K elements for k-fold.
+Why group-aware:
+    The dataset contains 538 unique contexts across 689 samples; 126 contexts
+    appear 2-5 times each, and 49 of those have mixed labels.  A naive
+    stratified split therefore lets the probe see both halves of a duplicate
+    context — the same passage in train and in test — which inflates the
+    reported metric without improving real generalisation.  Grouping by
+    context yields an honest, leakage-free estimate.
 """
 
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit, train_test_split
+
+
+_CONTEXT_RE = re.compile(
+    r"<\|im_start\|>user\r?\n(.*?)Note that your answer", re.DOTALL
+)
+
+
+def _extract_context(prompt: str) -> str:
+    """Extract the context passage from a ChatML prompt.
+
+    Returns the substring between the user-turn opener and the "Note that..."
+    instruction.  Falls back to a length-based prefix if the marker is absent
+    so unfamiliar prompts still produce a stable group key.
+    """
+    m = _CONTEXT_RE.search(prompt)
+    if m:
+        return m.group(1).strip()
+    return prompt[:500]
 
 
 def split_data(
@@ -30,12 +50,13 @@ def split_data(
 ) -> list[tuple[np.ndarray, np.ndarray | None, np.ndarray]]:
     """Split dataset indices into train, validation, and test subsets.
 
-    The default strategy performs a single stratified random split preserving
-    the class ratio in each subset.
+    Strategy:
+        * Group-aware split when ``df`` contains a ``prompt`` column — every
+          context lives in exactly one of train / val / test.
+        * Stratified random split as a fallback.
 
     Args:
         y:            Label array of shape ``(N,)`` with values in ``{0, 1}``.
-                      Used for stratification.
         df:           Optional full DataFrame (same row order as ``y``).
                       Required for group-aware splits.
         test_size:    Fraction of samples reserved for the held-out test set.
@@ -44,16 +65,38 @@ def split_data(
 
     Returns:
         A list of ``(idx_train, idx_val, idx_test)`` tuples of integer index
-        arrays.  ``idx_val`` may be ``None``.
-
-    Student task:
-        Replace or extend the skeleton below.  The only contract is that the
-        function returns the list described above.
+        arrays (a single tuple for the default single-split strategy).
     """
-
     idx = np.arange(len(y))
 
-    idx_train_val, idx_test = train_test_split(
+    # ------------------------------------------------------------------
+    # Group-aware path: keep duplicated contexts within one fold.
+    # ------------------------------------------------------------------
+    if df is not None and "prompt" in df.columns:
+        groups = df["prompt"].apply(_extract_context).values
+
+        gss_test = GroupShuffleSplit(
+            n_splits=1, test_size=test_size, random_state=random_state
+        )
+        idx_trval, idx_test = next(gss_test.split(idx, y, groups))
+
+        # Validation carved out of train+val so its size is `val_size` of total.
+        relative_val = val_size / (1.0 - test_size)
+        gss_val = GroupShuffleSplit(
+            n_splits=1, test_size=relative_val, random_state=random_state
+        )
+        rel_train, rel_val = next(
+            gss_val.split(idx_trval, y[idx_trval], groups[idx_trval])
+        )
+        idx_train = idx_trval[rel_train]
+        idx_val = idx_trval[rel_val]
+
+        return [(idx_train, idx_val, idx_test)]
+
+    # ------------------------------------------------------------------
+    # Fallback: stratified random split.
+    # ------------------------------------------------------------------
+    idx_trval, idx_test = train_test_split(
         idx,
         test_size=test_size,
         random_state=random_state,
@@ -61,10 +104,9 @@ def split_data(
     )
     relative_val = val_size / (1.0 - test_size)
     idx_train, idx_val = train_test_split(
-        idx_train_val,
+        idx_trval,
         test_size=relative_val,
         random_state=random_state,
-        stratify=y[idx_train_val],
+        stratify=y[idx_trval],
     )
     return [(idx_train, idx_val, idx_test)]
-
