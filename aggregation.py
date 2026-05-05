@@ -1,29 +1,35 @@
 """
 aggregation.py — Token aggregation strategy and feature extraction.
 
-Final strategy: concatenate three pooling variants of LAYER 15 and the
-neighbour-layer aggregate, so the probe can ensemble them at inference
-time:
+Final strategy: concatenate three pooling variants for two layers (15 and
+14) so that the probe can ensemble three logistic-regression sub-probes
+at inference time:
 
-    A: layer 15, last token only           ->  hidden_dim       (896)
-    C: layer 15, last + mean + max pool    ->  3 * hidden_dim   (2688)
-    D: layers 13/14/15/16, last + mean     ->  8 * hidden_dim   (7168)
+    A : layer 15, last token only        ->  hidden_dim       (896)
+    C : layer 15, last + mean + max pool ->  3 * hidden_dim   (2688)
+    D2: layer 14, last + mean pool       ->  2 * hidden_dim   (1792)
 
-Concatenated feature dim: 12 * hidden_dim = 10752 (for hidden_dim=896).
-The probe knows the slice boundaries via a constant exposed below.
+Concatenated feature dim: 6 * hidden_dim = 5376 (for hidden_dim=896).
+The probe knows the slice boundaries via the SLICE_INFO dict exposed
+below.
 
-Why this layout:
-    Diagnostic experiments (per-layer LogReg + group K-fold CV) selected
-    layer 15 as the strongest single layer (70.68% AUROC).  Single-variant
-    pipelines on layer 15 ranged 70.4-72.2% with std 4.3-7.1%.  A
-    probability-level ensemble of A + C + D reached 73.07% AUROC with
-    std 5.47% — better mean AND better lower bound than any single variant.
+Layer choice rationale:
+    The per-layer LogReg + group K-fold CV diagnostic identified layers 15
+    and 14 as the strongest individual layers (70.68% and 69.45% AUROC,
+    respectively).  Final-layer features (layer 24) scored only 63.00% —
+    representations near the output are tuned for next-token prediction
+    rather than truthfulness.
+
+Pooling choice rationale (diagnose_v4):
+    Earlier we tested an ensemble that also included a 4-neighbour-layer
+    aggregate (D = layers 13/14/15/16, last+mean, 7168-d).  Replacing D
+    with D2 (layer 14 alone, 1792-d) gave the same or higher mean AUROC
+    (73.64% vs 73.36%) at lower variance and 4x fewer features.
 
 Geometric features are kept available behind USE_GEOMETRIC for ablation
 but are NOT used in the final solution: the diagnose_final benchmark
-showed they slightly hurt AUROC (E_with_geometric scored 70.28% vs B's
-70.39%), most likely because length cues vary across context groups under
-group-aware splits.
+showed they slightly hurt AUROC, most likely because length cues vary
+across context groups under group-aware splits.
 """
 
 from __future__ import annotations
@@ -31,42 +37,40 @@ from __future__ import annotations
 import torch
 
 
-# Best single layer, identified by per-layer LogReg + group K-fold CV
-# (Qwen2.5-0.5B: 24 transformer layers + 1 embedding = 25 hidden states).
+# Best two layers identified by per-layer LogReg + group K-fold CV.
+# (Qwen2.5-0.5B: 24 transformer layers + 1 embedding = 25 hidden states.)
 _BEST_LAYER = 15
-_NEIGHBOR_LAYERS = (13, 14, 15, 16)
+_SECOND_LAYER = 14
 
-# Feature-vector slice boundaries, exposed for probe.py to slice the
-# concatenated vector back into (A, C, D) blocks at fit/predict time.
-# Filled lazily by `aggregate` once hidden_dim is known.  We use a
-# module-level dict so the probe can read it without import cycles.
+# Feature-vector slice boundaries, populated lazily so the probe can read
+# them without hard-coding the hidden dimension.
 SLICE_INFO: dict[str, slice] = {}
 
 
 def _set_slice_info(hidden_dim: int) -> None:
     """Populate SLICE_INFO once the hidden dimension is known."""
-    a_end = hidden_dim
-    c_end = a_end + 3 * hidden_dim
-    d_end = c_end + 2 * len(_NEIGHBOR_LAYERS) * hidden_dim
+    a_end = hidden_dim                       # A: 1 * h
+    c_end = a_end + 3 * hidden_dim           # C: +3 * h
+    d2_end = c_end + 2 * hidden_dim          # D2: +2 * h
     SLICE_INFO["A"] = slice(0, a_end)
     SLICE_INFO["C"] = slice(a_end, c_end)
-    SLICE_INFO["D"] = slice(c_end, d_end)
-    SLICE_INFO["hidden_dim"] = hidden_dim  # type: ignore[assignment]
-    SLICE_INFO["total"] = d_end             # type: ignore[assignment]
+    SLICE_INFO["D2"] = slice(c_end, d2_end)
+    SLICE_INFO["hidden_dim"] = hidden_dim    # type: ignore[assignment]
+    SLICE_INFO["total"] = d2_end             # type: ignore[assignment]
 
 
 def aggregate(
     hidden_states: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
-    """Concatenated A + C + D feature vector for ensemble probing.
+    """Concatenated A + C + D2 feature vector for ensemble probing.
 
     Args:
         hidden_states:  Tensor of shape ``(n_layers, seq_len, hidden_dim)``.
         attention_mask: 1-D tensor of shape ``(seq_len,)``; 1 for real tokens.
 
     Returns:
-        1-D feature tensor of shape ``(12 * hidden_dim,)``.
+        1-D feature tensor of shape ``(6 * hidden_dim,)``.
     """
     attention_mask = attention_mask.to(hidden_states.device)
     real_pos = attention_mask.nonzero(as_tuple=False)
@@ -78,7 +82,7 @@ def aggregate(
     # Cap layer indices at the deepest available hidden state for safety.
     n_avail = hidden_states.shape[0]
     best_layer = min(_BEST_LAYER, n_avail - 1)
-    neighbor_layers = [min(li, n_avail - 1) for li in _NEIGHBOR_LAYERS]
+    second_layer = min(_SECOND_LAYER, n_avail - 1)
 
     pieces: list[torch.Tensor] = []
 
@@ -93,12 +97,11 @@ def aggregate(
     max_tok_C = masked_for_max.max(dim=0).values
     pieces.extend([last_tok_C, mean_tok_C, max_tok_C])
 
-    # ---------- D: layers 13/14/15/16, last + mean ----------
-    for li in neighbor_layers:
-        layer = hidden_states[li]
-        last_tok = layer[last_pos]
-        mean_tok = (layer * mask_f).sum(dim=0) / n_real
-        pieces.extend([last_tok, mean_tok])
+    # ---------- D2: layer 14, last + mean ----------
+    layer_second = hidden_states[second_layer]
+    last_tok_D2 = layer_second[last_pos]
+    mean_tok_D2 = (layer_second * mask_f).sum(dim=0) / n_real
+    pieces.extend([last_tok_D2, mean_tok_D2])
 
     # Populate slice info on first call.
     if "A" not in SLICE_INFO:
@@ -113,9 +116,9 @@ def extract_geometric_features(
 ) -> torch.Tensor:
     """Hand-crafted statistics from hidden states.
 
-    NOT used in the final solution (diagnose_final showed a slight
-    AUROC drop vs the layer-15 baseline), but kept here for ablation.
-    Set ``USE_GEOMETRIC = True`` in solution.py to append them.
+    NOT used in the final solution (diagnose_final showed a slight AUROC
+    drop vs the layer-15 baseline), but kept here for ablation.  Set
+    ``USE_GEOMETRIC = True`` in solution.py to append them.
     """
     attention_mask = attention_mask.to(hidden_states.device)
     real_mask = attention_mask.bool()
