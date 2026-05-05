@@ -60,7 +60,7 @@ _SEED = 42
 _SUBPROBES = (
     ("A", False),
     ("C", False),
-    ("D", True),   # no sub-PCA needed after global PCA
+    #("D", True),   # no sub-PCA needed after global PCA
 )
 
 
