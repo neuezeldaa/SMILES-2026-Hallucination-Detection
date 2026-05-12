@@ -74,7 +74,10 @@ def aggregate(
     """
     attention_mask = attention_mask.to(hidden_states.device)
     real_pos = attention_mask.nonzero(as_tuple=False)
-    last_pos = int(real_pos[-1].item())
+    if real_pos.numel() >= 2:
+        last_pos = int(real_pos[-2].item())
+    else:
+        last_pos = int(real_pos[-1].item())
 
     mask_f = attention_mask.float().unsqueeze(-1)
     n_real = mask_f.sum().clamp(min=1.0)
