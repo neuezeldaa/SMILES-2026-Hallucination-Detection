@@ -450,6 +450,7 @@ has not seen during training. Our 74.29% AUROC and 74.61% accuracy
 should generalise without further loss because both numbers were
 measured on splits that already enforce context-level disjointness.
 
+https://disk.yandex.ru/d/2s0__EhBcW8e3g
 ---
 
 ## References
